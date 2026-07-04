@@ -29,13 +29,55 @@ const PROVIDERS = [
   "https://vsembed.ru",
   "https://vsembed.su",
   "https://vidsrcme.ru",
+  "https://vidsrc.pm",
+  "https://vidsrc.in",
 ];
 
 export const LANGUAGE_NAMES: Record<string, string> = {
   en: "English",
+  ar: "العربية (Arabic)",
+  es: "Español (Spanish)",
+  fr: "Français (French)",
+  tr: "Türkçe (Turkish)",
 };
 
 export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
+
+export function getLangCode(label: string): string {
+  const lower = label.toLowerCase();
+  if (lower.includes("arabic") || lower.includes("ar")) return "ar";
+  if (lower.includes("english") || lower.includes("en")) return "en";
+  if (lower.includes("french") || lower.includes("fr")) return "fr";
+  if (lower.includes("spanish") || lower.includes("es")) return "es";
+  if (lower.includes("russian") || lower.includes("ru")) return "ru";
+  if (lower.includes("turkish") || lower.includes("tr")) return "tr";
+  return "en";
+}
+
+async function fetchWithHeaders(url: string, customHeaders: Record<string, string> = {}) {
+  const defaultHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
+  };
+
+  return fetch(url, {
+    headers: {
+      ...defaultHeaders,
+      ...customHeaders
+    },
+    redirect: "follow"
+  });
+}
 
 // Simple in-memory cache to avoid scraping same query repeatedly (15 minutes)
 const cache = new Map<string, any>();
@@ -43,8 +85,8 @@ const cache = new Map<string, any>();
 async function scrapeProvider(domain: string, targetUrl: string) {
   console.log(`\n[${domain}] Starting scrape for URL: ${targetUrl}`);
   try {
-    // 1. Fetch the embed page
-    const embedRes = await fetch(targetUrl, { redirect: "follow" });
+    // 1. Fetch the embed page using browser headers
+    const embedRes = await fetchWithHeaders(targetUrl);
     if (!embedRes.ok) throw new Error(`Embed fetch failed: ${embedRes.status}`);
     const embedHtml = await embedRes.text();
 
@@ -54,10 +96,7 @@ async function scrapeProvider(domain: string, targetUrl: string) {
     const rcpUrl = `https://${rcpMatch[1]}`;
 
     // 3. Fetch the RCP page
-    const rcpRes = await fetch(rcpUrl, {
-      headers: { Referer: targetUrl },
-      redirect: "follow",
-    });
+    const rcpRes = await fetchWithHeaders(rcpUrl, { Referer: targetUrl });
     if (!rcpRes.ok) throw new Error(`RCP fetch failed: ${rcpRes.status}`);
     const rcpHtml = await rcpRes.text();
 
@@ -67,10 +106,7 @@ async function scrapeProvider(domain: string, targetUrl: string) {
     const prorcpUrl = `https://cloudorchestranova.com${prorcpMatch[1]}`;
 
     // 5. Fetch the ProRCP page
-    const prorcpRes = await fetch(prorcpUrl, {
-      headers: { Referer: rcpUrl },
-      redirect: "follow",
-    });
+    const prorcpRes = await fetchWithHeaders(prorcpUrl, { Referer: rcpUrl });
     if (!prorcpRes.ok) throw new Error(`ProRCP fetch failed: ${prorcpRes.status}`);
     const prorcpHtml = await prorcpRes.text();
 
@@ -99,9 +135,7 @@ async function scrapeProvider(domain: string, targetUrl: string) {
       const m3u8UrlObj = new URL(hlsUrl);
       const tokenHost = m3u8UrlObj.host;
       try {
-        const tokenRes = await fetch(`https://${tokenHost}/generate.php`, {
-          headers: { Referer: prorcpUrl },
-        });
+        const tokenRes = await fetchWithHeaders(`https://${tokenHost}/generate.php`, { Referer: prorcpUrl });
         if (tokenRes.ok) {
           const token = await tokenRes.text();
           hlsUrl = hlsUrl.replace(/__TOKEN__/g, token.trim());
@@ -115,16 +149,27 @@ async function scrapeProvider(domain: string, targetUrl: string) {
     const proxiedHlsUrl = `/proxy/m3u8?url=${encodeURIComponent(hlsUrl)}`;
 
     // 8. Extract subtitles
-    const subtitles: string[] = [];
+    const subtitles: { label: string; url: string; lang: string }[] = [];
     const subsMatch = prorcpHtml.match(/var\s+default_subtitles\s*=\s*['"]([^'"]+)['"]/i);
     if (subsMatch && subsMatch[1] && subsMatch[1] !== "[]") {
       const subsArray = subsMatch[1].split(",");
       for (const sub of subsArray) {
         const parts = sub.split("]");
         if (parts.length === 2) {
-          subtitles.push(parts[1]);
+          const rawLabel = parts[0].replace("[", "").trim();
+          const rawUrl = parts[1].trim();
+          const lang = getLangCode(rawLabel);
+          subtitles.push({
+            label: rawLabel,
+            url: `/subtitle-proxy?url=${encodeURIComponent(rawUrl)}`,
+            lang
+          });
         } else {
-          subtitles.push(sub);
+          subtitles.push({
+            label: "Subtitle",
+            url: `/subtitle-proxy?url=${encodeURIComponent(sub.trim())}`,
+            lang: "en"
+          });
         }
       }
     }
@@ -175,22 +220,75 @@ app.get("/extract", async (req, res) => {
   }, {});
 
   try {
-    const resultsArr = await Promise.all(
-      Object.entries(urls).map(async ([domain, url]) => {
+    // Fetch OpenSubtitles in parallel to speed up extraction response
+    let openSubsPromise = Promise.resolve<any[]>([]);
+    try {
+      openSubsPromise = (async () => {
         try {
-          const result = await scrapeProvider(domain, url);
-          return [domain, result];
-        } catch (err: any) {
-          console.error(`[${domain}] Final error: ${err.message}`);
-          return [
-            domain,
-            { hls_url: null, subtitles: [], error: err.message },
-          ];
+          const imdb_id = await getIMDbIdFromTMDB(tmdb_id, type);
+          if (imdb_id) {
+            const baseList = await searchSubtitles(imdb_id);
+            const list = await Promise.all(
+              baseList.map(async (sub: any) => {
+                try {
+                  const url = await getSubtitleDownloadUrl(sub.file_id);
+                  return {
+                    label: `${sub.language_name} (OpenSubtitles)`,
+                    url: `/subtitle-proxy?url=${encodeURIComponent(url)}`,
+                    lang: sub.language
+                  };
+                } catch {
+                  return null;
+                }
+              })
+            );
+            return list.filter(Boolean);
+          }
+        } catch (e) {
+          console.error("Failed to fetch OpenSubtitles during extract:", e);
         }
+        return [];
+      })();
+    } catch (e) {
+      console.error(e);
+    }
+
+    const [resultsArr, openSubsResult] = await Promise.all([
+      Promise.all(
+        Object.entries(urls).map(async ([domain, url]) => {
+          try {
+            const result = await scrapeProvider(domain, url);
+            return [domain, result];
+          } catch (err: any) {
+            console.error(`[${domain}] Final error: ${err.message}`);
+            return [
+              domain,
+              { hls_url: null, subtitles: [], error: err.message },
+            ];
+          }
+        })
+      ),
+      openSubsPromise
+    ]);
+
+    // Merge OpenSubtitles with scraped subtitles for each provider
+    const results = Object.fromEntries(
+      resultsArr.map(([domain, data]: any) => {
+        if (data.hls_url) {
+          const mergedSubs = [...(data.subtitles || [])];
+          const existingUrls = new Set(mergedSubs.map(s => s.url));
+          
+          for (const sub of openSubsResult || []) {
+            if (sub && !existingUrls.has(sub.url)) {
+              mergedSubs.push(sub);
+            }
+          }
+          return [domain, { ...data, subtitles: mergedSubs }];
+        }
+        return [domain, data];
       })
     );
 
-    const results = Object.fromEntries(resultsArr);
     const success = Object.values(results).some((r: any) => r.hls_url);
 
     const response = { success, results };
@@ -359,18 +457,22 @@ app.get("/subtitle-proxy", async (req, res) => {
     const subtitleRes = await fetch(fileUrl);
     const srt = await subtitleRes.text();
 
-    const vtt =
-      "WEBVTT\n\n" +
-      srt
-        .replace(/\r+/g, "")
-        .replace(/^\s+|\s+$/g, "")
-        .split("\n")
-        .map((line) =>
-          line.replace(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/g, "$1:$2:$3.$4")
-        )
-        .join("\n");
+    let vtt = srt;
+    if (!srt.trim().startsWith("WEBVTT")) {
+      vtt =
+        "WEBVTT\n\n" +
+        srt
+          .replace(/\r+/g, "")
+          .replace(/^\s+|\s+$/g, "")
+          .split("\n")
+          .map((line) =>
+            line.replace(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/g, "$1:$2:$3.$4")
+          )
+          .join("\n");
+    }
 
     res.setHeader("Content-Type", "text/vtt");
+    res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(vtt);
   } catch (err: any) {
     console.error("Subtitle Proxy Error:", err.message);
