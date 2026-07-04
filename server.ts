@@ -527,6 +527,7 @@ app.get("/proxy/m3u8", async (req, res) => {
       .join("\n");
 
     res.set("Content-Type", "application/vnd.apple.mpegurl");
+    res.set("Cache-Control", "public, max-age=5"); // cache playlist for 5 seconds
     res.send(rewritten);
   } catch (err: any) {
     res.status(500).send("Proxy error: " + err.message);
@@ -552,6 +553,7 @@ app.get("/proxy/ts", async (req, res) => {
     // Always force MPEG-TS video content type to avoid MIME-type decode issues in browsers
     res.set("Content-Type", "video/mp2t");
     res.set("Access-Control-Allow-Origin", "*");
+    res.set("Cache-Control", "public, max-age=86400"); // Cache video chunks in browser for 24 hours to boost speed & seek times!
 
     // stream the response
     if (fetchRes.body) {
